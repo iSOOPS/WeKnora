@@ -59,6 +59,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
       - name: Verify Harbor credentials and push permission
         if: github.event_name != 'pull_request'
         env:

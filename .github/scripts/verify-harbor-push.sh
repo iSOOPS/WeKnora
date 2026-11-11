@@ -38,15 +38,25 @@ trap 'rm -rf "${tmpdir}"' EXIT
 auth_code=$(curl -sS -o "${tmpdir}/current.json" -w '%{http_code}' \
   -u "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" \
   "${api}/users/current" || echo 000)
-if [ "${auth_code}" != "200" ]; then
-  echo "::error::Harbor 认证失败（HTTP ${auth_code}）：HARBOR_USERNAME / HARBOR_PASSWORD 不正确。"
-  echo "::error::项目级机器人用户名格式为 robot\$<项目名>+<机器人名>，例如 robot\$library+github-isoops2；"
+
+if [ "${auth_code}" = "200" ]; then
+  current_user=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("username",""))' "${tmpdir}/current.json" 2>/dev/null || true)
+  echo "认证通过（用户），当前账号：${current_user:-<unknown>}"
+elif [ "${auth_code}" = "412" ] && grep -q 'security context: robot' "${tmpdir}/current.json" 2>/dev/null; then
+  # Harbor 对机器人账号访问 /users/current 会返回 412（机器人没有 current user），
+  # 这是认证成功的正常表现，不是错误。
+  echo "认证通过（机器人账号）。"
+elif [ "${auth_code}" = "401" ]; then
+  echo "::error::Harbor 认证失败（HTTP 401）：HARBOR_USERNAME / HARBOR_PASSWORD 不正确。"
+  echo "::error::项目级机器人用户名格式为 robot\$<项目名>+<机器人名>，例如 robot\$library+robot2；"
   echo "::error::系统级机器人为 robot\$<机器人名>。请从 Harbor「机器人账户」页面复制完整用户名。"
   echo "::error::响应：$(head -c 300 "${tmpdir}/current.json" 2>/dev/null || true)"
   exit 1
+else
+  echo "::error::Harbor 认证检查异常（HTTP ${auth_code}）。"
+  echo "::error::响应：$(head -c 300 "${tmpdir}/current.json" 2>/dev/null || true)"
+  exit 1
 fi
-current_user=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1])).get("username",""))' "${tmpdir}/current.json" 2>/dev/null || true)
-echo "认证通过，当前账号：${current_user:-<unknown>}"
 
 # (1) 项目存在，且不是代理缓存项目（Harbor 禁止向 proxy cache 项目推送）。
 proj_code=$(curl -sS -o "${tmpdir}/project.json" -w '%{http_code}' \
