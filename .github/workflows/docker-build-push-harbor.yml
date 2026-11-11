@@ -60,7 +60,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - name: Verify Harbor credentials and push permission
-        if: env.PUSH == 'true'
+        if: github.event_name != 'pull_request'
         env:
           HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
           HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
@@ -205,8 +205,24 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      # docker/login-action 在 username/password 同时为空时会抛出
+      # "Username and password required"。这里先给出可执行的错误提示，
+      # 避免只看到 action 的原始报错。
+      - name: Validate Harbor credentials
+        if: github.event_name != 'pull_request'
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          if [ -z "${HARBOR_USERNAME:-}" ] || [ -z "${HARBOR_PASSWORD:-}" ]; then
+            echo "::error::Harbor 登录凭据为空。请在 Settings -> Secrets and variables -> Actions 中配置："
+            echo "::error::  HARBOR_USERNAME = robot\$<机器人名> 或 Harbor 用户名"
+            echo "::error::  HARBOR_PASSWORD = 对应的密码 / robot token"
+            exit 1
+          fi
+
       - name: Login to Harbor
-        if: env.PUSH == 'true'
+        if: github.event_name != 'pull_request'
         uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
