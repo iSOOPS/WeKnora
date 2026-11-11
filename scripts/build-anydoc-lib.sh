@@ -125,6 +125,40 @@ if [ "$go_version" != "$anydoc_version" ]; then
   exit 1
 fi
 
+# Go 1.26+ rejects static archives that contain LTO bitcode sections when the
+# archive is referenced from #cgo LDFLAGS. rustc embeds .llvmbc/.llvmcmd in
+# staticlibs (both for LTO builds and for the precompiled std it bundles); the
+# machine code is already in the archive, so the bitcode can be dropped.
+strip_lto_sections() {
+  local archive="$1"
+  local objcopy=""
+  local candidate
+  for candidate in objcopy llvm-objcopy gobjcopy; do
+    if command -v "$candidate" >/dev/null 2>&1; then
+      objcopy="$candidate"
+      break
+    fi
+  done
+  if [ -z "$objcopy" ]; then
+    echo "warning: objcopy/llvm-objcopy not found; $archive may contain LTO sections." >&2
+    echo "warning: Go 1.26+ rejects them when linking via #cgo LDFLAGS (install binutils or llvm)." >&2
+    return 0
+  fi
+
+  local stripped="$archive.lto-stripped"
+  if "$objcopy" \
+      --remove-section=.llvmbc \
+      --remove-section=.llvmcmd \
+      --remove-section=.llvm.lto \
+      "$archive" "$stripped"; then
+    mv "$stripped" "$archive"
+    echo "Stripped LTO bitcode sections from $archive"
+  else
+    rm -f "$stripped"
+    echo "warning: failed to strip LTO sections from $archive" >&2
+  fi
+}
+
 echo "Building anydoc $anydoc_version archive for $target"
 prepare_patched_anydoc
 
@@ -136,6 +170,9 @@ cargo build --release --locked --manifest-path "$crate_dir/Cargo.toml" --target 
 dest="$crate_dir/lib/$lib_dir"
 mkdir -p "$dest"
 cp "$crate_dir/target/$target/release/$lib_name" "$dest/$lib_name"
+if [ "$lib_name" = "libanydoc_go.a" ]; then
+  strip_lto_sections "$dest/$lib_name"
+fi
 
 echo "Wrote $dest/$lib_name"
 echo "Build WeKnora with the archive: go build -tags anydoc ./cmd/server"
