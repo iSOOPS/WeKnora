@@ -1,0 +1,265 @@
+name: Docker Image CI (Harbor)
+
+# 打包 WeKnora 核心镜像并推送到 Harbor：
+#   - <prefix>-app        <- docker/Dockerfile.app        (context: .)
+#   - <prefix>-docreader  <- docker/Dockerfile.docreader  (context: .)
+#   - <prefix>-ui         <- frontend/Dockerfile          (context: ./frontend)
+#   - <prefix>-sandbox    <- docker/Dockerfile.sandbox    (target: sandbox)
+# 如需 sandbox 的 cube / desktop / desktop-cube 变体，在 build-and-push 矩阵中
+# 追加对应 target 的条目即可（构建耗时较长，默认不启用）。
+#
+# 与 .github/workflows/docker-image.yml 的区别：本工作流只推 Harbor，
+# 不登录/推送 Docker Hub。PR 只构建不推送；push main、v* tag、手动触发才推送。
+#
+# 需要在仓库 Settings -> Secrets and variables -> Actions 中配置：
+#   HARBOR_USERNAME   Harbor 账号或机器人账号（robot$xxx）
+#   HARBOR_PASSWORD   对应密码 / token
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "构建平台（多平台用逗号分隔，例如 linux/amd64,linux/arm64）"
+        type: string
+        default: "linux/amd64"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Harbor 地址。镜像名中的第一段即项目名（下例为 library）。
+  # 项目为私有项目时，账号必须在该项目内具有 push 权限。
+  REGISTRY: harbor.gxrs.net
+  # 镜像名前缀，最终镜像为 ${REGISTRY}/${IMAGE_PREFIX}-<组件>
+  IMAGE_PREFIX: library/weknora
+  # 默认单架构，避免 QEMU 拖慢 app / docreader 这类重镜像；
+  # 手动触发时可通过 inputs.platforms 覆盖。
+  PLATFORMS: ${{ inputs.platforms || 'linux/amd64' }}
+  # PR 只验证能否构建，不推送。
+  PUSH: ${{ github.event_name != 'pull_request' }}
+  # 与 Dockerfile.app 的默认值一致：把进程内 office 解析引擎（Rust anydoc）打进 app 镜像。
+  WITH_ANYDOC: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 推送前置校验：直接问 Harbor 是否允许写入，避免构建几十分钟后才在 push 阶段失败。
+  # PR 构建时所有步骤被 if 跳过，job 仍然成功，保证下游 needs 不被级联跳过。
+  # ---------------------------------------------------------------------------
+  preflight:
+    name: Verify Harbor is pushable
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Verify Harbor credentials and push permission
+        if: env.PUSH == 'true'
+        env:
+          HARBOR_USERNAME: ${{ secrets.HARBOR_USERNAME }}
+          HARBOR_PASSWORD: ${{ secrets.HARBOR_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${HARBOR_USERNAME:-}" ] || [ -z "${HARBOR_PASSWORD:-}" ]; then
+            echo "::error::缺少 secrets.HARBOR_USERNAME / secrets.HARBOR_PASSWORD。"
+            exit 1
+          fi
+
+          project="${IMAGE_PREFIX%%/*}"
+          images=(
+            "${IMAGE_PREFIX}-app"
+            "${IMAGE_PREFIX}-docreader"
+            "${IMAGE_PREFIX}-ui"
+            "${IMAGE_PREFIX}-sandbox"
+          )
+
+          # (1) 项目存在，且不是代理缓存项目（Harbor 禁止向 proxy cache 项目推送）
+          proj_json=$(curl -sS --fail-with-body \
+            -u "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" \
+            "https://${REGISTRY}/api/v2.0/projects/${project}" || true)
+          if [ -z "${proj_json}" ]; then
+            echo "::error::无法读取 Harbor 项目 ${project}，请检查账号密码、项目名与 REGISTRY。"
+            exit 1
+          fi
+          registry_id=$(printf '%s' "${proj_json}" \
+            | python3 -c 'import sys,json;print(json.load(sys.stdin).get("registry_id") or 0)' 2>/dev/null || echo 0)
+          if [ "${registry_id}" != "0" ]; then
+            echo "::error::Harbor 项目 ${project} 是代理缓存项目（registry_id=${registry_id}），禁止推送。"
+            exit 1
+          fi
+
+          for image in "${images[@]}"; do
+            echo "检查 ${REGISTRY}/${image}"
+
+            # (2) token 服务必须真的授予 push
+            token_json=$(curl -sS --fail-with-body \
+              -u "${HARBOR_USERNAME}:${HARBOR_PASSWORD}" \
+              "https://${REGISTRY}/service/token?service=harbor-registry&scope=repository:${image}:pull,push" \
+              || true)
+            granted=$(printf '%s' "${token_json}" \
+              | python3 -c '
+            import base64, json, sys
+            data = json.load(sys.stdin) or {}
+            token = data.get("token") or data.get("access_token") or ""
+            parts = token.split(".")
+            if len(parts) != 3:
+                raise SystemExit(0)
+            payload = parts[1] + "=" * (-len(parts[1]) % 4)
+            actions = set()
+            for entry in json.loads(base64.urlsafe_b64decode(payload)).get("access", []):
+                actions.update(entry.get("actions", []))
+            print(" ".join(sorted(actions)))
+            ' 2>/dev/null || true)
+            echo "  授予的权限：${granted:-<无>}"
+            if ! printf '%s' "${granted}" | grep -qw push; then
+              echo "::error::账号对 ${REGISTRY}/${image} 没有 push 权限。"
+              echo "::error::请在 Harbor 确认机器人账号未停用，且对项目 ${project} 具有 Maintainer/Developer 角色。"
+              exit 1
+            fi
+
+            # (3) registry 写入探测：带 token HEAD 不存在的 manifest，404=鉴权通过，401/403=被拒
+            probe_token=$(printf '%s' "${token_json}" \
+              | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))')
+            probe_code=$(curl -sS -o /dev/null -w '%{http_code}' -I \
+              -H "Authorization: Bearer ${probe_token}" \
+              "https://${REGISTRY}/v2/${image}/manifests/__push_probe__" || echo 000)
+            echo "  registry 写入探测：HTTP ${probe_code}（期望 404）"
+            if [ "${probe_code}" != "404" ]; then
+              echo "::error::registry 端拒绝对 ${REGISTRY}/${image} 的写入（HTTP ${probe_code}）。"
+              exit 1
+            fi
+          done
+
+          echo "Harbor 推送前置校验通过。"
+
+  # ---------------------------------------------------------------------------
+  # 构建矩阵：四个镜像并行构建，单个失败不影响其它镜像。
+  # ---------------------------------------------------------------------------
+  build-and-push:
+    name: Build ${{ matrix.name }}
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ matrix.timeout }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: app
+            dockerfile: docker/Dockerfile.app
+            context: .
+            target: ""
+            free_disk: true
+            timeout: 120
+          - name: docreader
+            dockerfile: docker/Dockerfile.docreader
+            context: .
+            target: ""
+            free_disk: true
+            timeout: 90
+          - name: ui
+            dockerfile: frontend/Dockerfile
+            context: ./frontend
+            target: ""
+            free_disk: false
+            timeout: 30
+          - name: sandbox
+            dockerfile: docker/Dockerfile.sandbox
+            context: .
+            target: sandbox
+            free_disk: false
+            timeout: 60
+
+    steps:
+      # app / docreader 体积大，先释放 Runner 磁盘，避免 No space left on device。
+      - name: Free Disk Space
+        if: matrix.free_disk
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      # 与 scripts/get_version.sh 保持同一套版本来源（VERSION 文件 + GITHUB_SHA）。
+      - name: Prepare version info
+        id: version
+        run: |
+          eval "$(./scripts/get_version.sh env)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "commit_id=$COMMIT_ID" >> "$GITHUB_OUTPUT"
+          echo "build_time=$BUILD_TIME" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to Harbor
+        if: env.PUSH == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_PASSWORD }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_PREFIX }}-${{ matrix.name }}
+          tags: |
+            # v0.9.0 -> v0.9.0 / 0.9.0 / 0.9
+            type=semver,pattern={{raw}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            # main -> main；PR -> pr-<n>
+            type=ref,event=branch
+            type=ref,event=pr
+            # main 与 v* tag 附带 latest
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v') }}
+            # 任意提交：完整 commit sha，便于按提交定位镜像
+            type=sha,format=long
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.target }}
+          platforms: ${{ env.PLATFORMS }}
+          push: ${{ env.PUSH == 'true' }}
+          provenance: false
+          build-args: |
+            VERSION_ARG=${{ steps.version.outputs.version }}
+            COMMIT_ID_ARG=${{ steps.version.outputs.commit_id }}
+            BUILD_TIME_ARG=${{ steps.version.outputs.build_time }}
+            VITE_FRONTEND_COMMIT=${{ steps.version.outputs.commit_id }}
+            WITH_ANYDOC=${{ env.WITH_ANYDOC }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=weknora-${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=weknora-${{ matrix.name }},ignore-error=true
+
+      - name: Summary
+        run: |
+          {
+            echo "### 镜像构建完成：${{ matrix.name }}"
+            echo ""
+            echo "- 镜像：\`${REGISTRY}/${IMAGE_PREFIX}-${{ matrix.name }}\`"
+            echo "- 标签：\`${{ steps.meta.outputs.tag-names }}\`"
+            echo "- 平台：\`${PLATFORMS}\`"
+            echo "- 推送：\`${PUSH}\`"
+            echo "- Digest：\`${{ steps.build.outputs.digest }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
